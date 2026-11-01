@@ -1,0 +1,19 @@
+# Entorno virtual y cache de Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Credenciales locales (Jamas subir el .env a GitHub)
+.env
+
+# Logs y temporales
+logs/
+*.log
+.DS_Store
+Thumbs.db
+
+# Archivos temporales de SQLite (solo subimos el .db principal si queremos persistencia)
+*.db-shm
+*.db-wal

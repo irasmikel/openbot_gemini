@@ -1,0 +1,515 @@
+import sys
+import time
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+import httpx
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from core.config import settings
+from core.logger import get_logger
+from core.database import init_database, get_db_connection, record_agent_heartbeat
+from agents.quantstats import QuantStatsAgent
+
+logger = get_logger("RealDataSyncV3")
+
+
+def log_api_call(provider: str, endpoint: str, status_code: int) -> None:
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db_connection() as conn:
+        conn.execute("""
+        INSERT INTO api_usage_log (provider, endpoint, status_code, called_date_utc, called_timestamp_utc)
+        VALUES (?, ?, ?, ?, ?);
+        """, (provider, endpoint, status_code, today_str, now_str))
+
+
+def purge_synthetic_and_test_data() -> None:
+    logger.info("Limpiando datos de prueba y registros sinteticos anteriores...")
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM live_alerts;")
+        conn.execute("DELETE FROM predictions_audit;")
+        conn.execute("DELETE FROM odds_snapshots;")
+        conn.execute("DELETE FROM matches WHERE football_data_match_id IS NULL OR football_data_match_id < 10000;")
+
+
+def ensure_standings_table() -> None:
+    with get_db_connection() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS team_season_stats (
+            team_id INTEGER PRIMARY KEY,
+            competition_code TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            played_games INTEGER NOT NULL,
+            won INTEGER NOT NULL,
+            draw INTEGER NOT NULL,
+            lost INTEGER NOT NULL,
+            points INTEGER NOT NULL,
+            goals_for INTEGER NOT NULL,
+            goals_against INTEGER NOT NULL,
+            updated_at_utc TEXT NOT NULL,
+            FOREIGN KEY (team_id) REFERENCES teams(team_id)
+        );
+        """)
+
+
+def normalize_team_key(name: str) -> str:
+    if not name:
+        return ""
+    s = name.lower().strip()
+    for token in ["fc", "cf", "ud", "rcd", "cd", "ssc", "ac", "as", "rb", "vfl", "1.", "sv", "bsc", "tsg", "sc", "osc", "rc", "afc", "de futbol", "de bilbao", "balompie", "club"]:
+        s = s.replace(f" {token} ", " ").replace(f"^{token} ", "").replace(f" {token}$", "")
+    replacements = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n", "ö": "o", "ä": "a",
+        "athletic": "athletic bilbao",
+        "real sociedad": "real sociedad",
+        "atletico": "atletico madrid",
+        "celta": "celta vigo",
+        "betis": "real betis",
+        "alaves": "alaves",
+        "espanyol": "espanyol",
+        "barcelona": "barcelona",
+        "real madrid": "real madrid",
+        "manchester united": "man united",
+        "manchester city": "man city",
+        "tottenham": "tottenham",
+        "newcastle": "newcastle",
+        "wolverhampton": "wolves",
+        "nottingham": "nottingham",
+        "brighton": "brighton",
+        "west ham": "west ham",
+        "aston villa": "aston villa",
+        "bournemouth": "bournemouth",
+        "inter": "inter milan",
+        "milan": "ac milan",
+        "napoli": "napoli",
+        "juventus": "juventus",
+        "atalanta": "atalanta",
+        "bologna": "bologna",
+        "fiorentina": "fiorentina",
+        "lazio": "lazio",
+        "roma": "roma",
+        "bayern": "bayern munich",
+        "leverkusen": "bayer leverkusen",
+        "dortmund": "borussia dortmund",
+        "leipzig": "rb leipzig",
+        "frankfurt": "eintracht frankfurt",
+        "stuttgart": "stuttgart",
+        "m'gladbach": "monchengladbach",
+        "monchengladbach": "monchengladbach",
+        "paris": "paris saint germain",
+        "psg": "paris saint germain",
+        "marseille": "marseille",
+        "monaco": "monaco",
+        "lille": "lille",
+        "lyon": "lyon",
+    }
+    for k, v in replacements.items():
+        if k in s:
+            s = s.replace(k, v)
+    return "".join(ch for ch in s if ch.isalnum())
+
+
+def teams_match(name_a: str, name_b: str) -> bool:
+    ka = normalize_team_key(name_a)
+    kb = normalize_team_key(name_b)
+    if not ka or not kb:
+        return False
+    return ka == kb or ka in kb or kb in ka or ka[:6] == kb[:6]
+
+
+def get_or_create_team(conn, team_name: str, comp_code: str, fd_team_id: int = None) -> int:
+    if fd_team_id:
+        row = conn.execute("SELECT team_id FROM teams WHERE football_data_team_id = ?;", (fd_team_id,)).fetchone()
+        if row:
+            conn.execute("UPDATE teams SET canonical_name = ? WHERE team_id = ?;", (team_name, row["team_id"]))
+            return int(row["team_id"])
+
+    row = conn.execute("SELECT team_id FROM teams WHERE canonical_name = ?;", (team_name,)).fetchone()
+    if row:
+        return int(row["team_id"])
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("""
+    INSERT INTO teams (canonical_name, competition_code, football_data_team_id, elo_rating, updated_at_utc)
+    VALUES (?, ?, ?, 1550.0, ?);
+    """, (team_name, comp_code, fd_team_id, now_str))
+    return int(conn.execute("SELECT last_insert_rowid() as id;").fetchone()["id"])
+
+
+def sync_standings_and_matches_football_data() -> int:
+    if not settings.is_key_configured(settings.football_data_api_key):
+        return 0
+
+    token = settings.football_data_api_key.get_secret_value().strip()
+    headers = {"X-Auth-Token": token}
+
+    date_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_to = (datetime.now(timezone.utc) + timedelta(days=4)).strftime("%Y-%m-%d")
+
+    with get_db_connection() as conn:
+        comps = conn.execute("SELECT canonical_code, football_data_code, name FROM competitions WHERE is_active = 1;").fetchall()
+
+    total_matches = 0
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    with httpx.Client(timeout=15.0) as client:
+        for comp in comps:
+            fd_code = comp["football_data_code"]
+            if not fd_code:
+                continue
+
+            st_url = f"https://api.football-data.org/v4/competitions/{fd_code}/standings"
+            try:
+                r_st = client.get(st_url, headers=headers)
+                log_api_call("FOOTBALL_DATA", f"/competitions/{fd_code}/standings", r_st.status_code)
+                if r_st.status_code == 200:
+                    st_data = r_st.json()
+                    for st_block in st_data.get("standings", []):
+                        if st_block.get("type") == "TOTAL":
+                            with get_db_connection() as conn:
+                                for row_t in st_block.get("table", []):
+                                    t_info = row_t.get("team", {})
+                                    t_name = t_info.get("shortName") or t_info.get("name")
+                                    if not t_name:
+                                        continue
+                                    t_id = get_or_create_team(conn, t_name, comp["canonical_code"], t_info.get("id"))
+                                    played = max(1, int(row_t.get("playedGames", 1)))
+                                    pts = int(row_t.get("points", 0))
+                                    gf = int(row_t.get("goalsFor", 0))
+                                    ga = int(row_t.get("goalsAgainst", 0))
+                                    pos = int(row_t.get("position", 10))
+                                    elo_est = 1500.0 + ((pts / played) - 1.35) * 180.0 + ((gf - ga) / played) * 45.0
+
+                                    conn.execute("UPDATE teams SET elo_rating = ?, updated_at_utc = ? WHERE team_id = ?;", (round(elo_est, 1), now_str, t_id))
+                                    conn.execute("""
+                                    INSERT INTO team_season_stats (
+                                        team_id, competition_code, position, played_games, won, draw, lost, points, goals_for, goals_against, updated_at_utc
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT(team_id) DO UPDATE SET
+                                        position = excluded.position,
+                                        played_games = excluded.played_games,
+                                        won = excluded.won,
+                                        draw = excluded.draw,
+                                        lost = excluded.lost,
+                                        points = excluded.points,
+                                        goals_for = excluded.goals_for,
+                                        goals_against = excluded.goals_against,
+                                        updated_at_utc = excluded.updated_at_utc;
+                                    """, (
+                                        t_id, comp["canonical_code"], pos, played,
+                                        int(row_t.get("won", 0)), int(row_t.get("draw", 0)), int(row_t.get("lost", 0)),
+                                        pts, gf, ga, now_str
+                                    ))
+                time.sleep(0.35)
+            except Exception as e:
+                logger.error(f"Error descargando clasificacion de {comp['name']}: {e}")
+
+            m_url = f"https://api.football-data.org/v4/competitions/{fd_code}/matches"
+            try:
+                r_m = client.get(m_url, headers=headers, params={"dateFrom": date_from, "dateTo": date_to})
+                log_api_call("FOOTBALL_DATA", f"/competitions/{fd_code}/matches", r_m.status_code)
+                if r_m.status_code == 200:
+                    matches_list = r_m.json().get("matches", [])
+                    with get_db_connection() as conn:
+                        for m in matches_list:
+                            fd_match_id = m.get("id")
+                            h_info = m.get("homeTeam", {})
+                            a_info = m.get("awayTeam", {})
+                            h_name = h_info.get("shortName") or h_info.get("name")
+                            a_name = a_info.get("shortName") or a_info.get("name")
+                            if not h_name or not a_name:
+                                continue
+
+                            h_id = get_or_create_team(conn, h_name, comp["canonical_code"], h_info.get("id"))
+                            a_id = get_or_create_team(conn, a_name, comp["canonical_code"], a_info.get("id"))
+
+                            utc_date = (m.get("utcDate") or "").replace("T", " ").replace("Z", "")[:19]
+                            raw_status = m.get("status", "SCHEDULED")
+                            if raw_status in ("IN_PLAY", "PAUSED"):
+                                st_mapped = "LIVE"
+                            elif raw_status == "FINISHED":
+                                st_mapped = "FINISHED"
+                            else:
+                                st_mapped = "SCHEDULED"
+
+                            score_ft = m.get("score", {}).get("fullTime", {})
+                            h_score = score_ft.get("home")
+                            a_score = score_ft.get("away")
+
+                            conn.execute("""
+                            INSERT INTO matches (
+                                competition_code, home_team_id, away_team_id, kickoff_utc,
+                                status, home_score, away_score, football_data_match_id, last_updated_utc
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(football_data_match_id) DO UPDATE SET
+                                home_team_id = excluded.home_team_id,
+                                away_team_id = excluded.away_team_id,
+                                kickoff_utc = excluded.kickoff_utc,
+                                status = excluded.status,
+                                home_score = excluded.home_score,
+                                away_score = excluded.away_score,
+                                last_updated_utc = excluded.last_updated_utc;
+                            """, (
+                                comp["canonical_code"], h_id, a_id, utc_date,
+                                st_mapped, h_score, a_score, fd_match_id, now_str
+                            ))
+                            total_matches += 1
+                time.sleep(0.35)
+            except Exception as e:
+                logger.error(f"Error descargando partidos de {comp['name']}: {e}")
+
+    return total_matches
+
+
+def sync_real_odds_from_the_odds_api() -> int:
+    if not settings.is_key_configured(settings.odds_api_key):
+        return 0
+
+    api_key = settings.odds_api_key.get_secret_value().strip()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    matched_odds_count = 0
+
+    with get_db_connection() as conn:
+        comps = conn.execute("SELECT canonical_code, odds_api_key, name FROM competitions WHERE is_active = 1;").fetchall()
+        db_matches = conn.execute("""
+        SELECT m.match_id, m.competition_code, t1.canonical_name as home_name, t2.canonical_name as away_name
+        FROM matches m
+        JOIN teams t1 ON m.home_team_id = t1.team_id
+        JOIN teams t2 ON m.away_team_id = t2.team_id
+        WHERE m.status IN ('SCHEDULED', 'LIVE');
+        """).fetchall()
+
+    with httpx.Client(timeout=15.0) as client:
+        for comp in comps:
+            sport_key = comp["odds_api_key"]
+            if not sport_key:
+                continue
+
+            comp_matches = [m for m in db_matches if m["competition_code"] == comp["canonical_code"]]
+            if not comp_matches:
+                continue
+
+            url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/"
+            params = {
+                "apiKey": api_key,
+                "regions": "eu",
+                "markets": "h2h",
+                "oddsFormat": "decimal"
+            }
+
+            try:
+                resp = client.get(url, params=params)
+                log_api_call("ODDS_API", f"/sports/{sport_key}/odds", resp.status_code)
+                if resp.status_code != 200:
+                    continue
+
+                events = resp.json()
+                for ev in events:
+                    ev_home = ev.get("home_team", "")
+                    ev_away = ev.get("away_team", "")
+                    bookmakers = ev.get("bookmakers", [])
+                    if not bookmakers:
+                        continue
+
+                    target_match = None
+                    for db_m in comp_matches:
+                        if teams_match(db_m["home_name"], ev_home) and teams_match(db_m["away_name"], ev_away):
+                            target_match = db_m
+                            break
+
+                    if not target_match:
+                        continue
+
+                    odd_h_list, odd_x_list, odd_a_list = [], [], []
+                    bookie_names = []
+                    for bm in bookmakers:
+                        bm_title = bm.get("title", "EU Bookie")
+                        for mk in bm.get("markets", []):
+                            if mk.get("key") == "h2h":
+                                outcomes = mk.get("outcomes", [])
+                                o_h, o_x, o_a = None, None, None
+                                for out in outcomes:
+                                    if out.get("name") == ev_home:
+                                        o_h = float(out.get("price", 0))
+                                    elif out.get("name") == ev_away:
+                                        o_a = float(out.get("price", 0))
+                                    elif out.get("name", "").lower() == "draw":
+                                        o_x = float(out.get("price", 0))
+                                if o_h and o_x and o_a:
+                                    odd_h_list.append(o_h)
+                                    odd_x_list.append(o_x)
+                                    odd_a_list.append(o_a)
+                                    bookie_names.append(bm_title)
+
+                    if not odd_h_list:
+                        continue
+
+                    avg_h = round(sum(odd_h_list) / len(odd_h_list), 2)
+                    avg_x = round(sum(odd_x_list) / len(odd_x_list), 2)
+                    avg_a = round(sum(odd_a_list) / len(odd_a_list), 2)
+
+                    raw_h = 1.0 / avg_h
+                    raw_x = 1.0 / avg_x
+                    raw_a = 1.0 / avg_a
+                    overround = (raw_h + raw_x + raw_a) - 1.0
+                    total_raw = raw_h + raw_x + raw_a
+
+                    m_id = int(target_match["match_id"])
+                    bm_label = f"Media {len(odd_h_list)} Casas EU ({bookie_names[0]})"
+
+                    with get_db_connection() as conn:
+                        conn.execute("DELETE FROM odds_snapshots WHERE match_id = ? AND market = '1X2';", (m_id,))
+                        for sel, odd_v, r_p in [("HOME", avg_h, raw_h), ("DRAW", avg_x, raw_x), ("AWAY", avg_a, raw_a)]:
+                            conn.execute("""
+                            INSERT INTO odds_snapshots (
+                                match_id, bookmaker, market, selection, odd_value,
+                                implied_prob_raw, implied_prob_fair, market_margin, captured_at_utc
+                            ) VALUES (?, ?, '1X2', ?, ?, ?, ?, ?, ?);
+                            """, (
+                                m_id, bm_label, sel, odd_v,
+                                round(r_p, 4), round(r_p / total_raw, 4), round(overround, 4), now_str
+                            ))
+                    matched_odds_count += 1
+            except Exception as e:
+                logger.error(f"Error consultando The Odds API para {comp['name']}: {e}")
+
+    return matched_odds_count
+
+
+def run_real_statistical_analysis() -> None:
+    record_agent_heartbeat("AGENT_02_QUANTSTATS", status="RUNNING")
+    record_agent_heartbeat("AGENT_03_MARKETODDS", status="RUNNING")
+    record_agent_heartbeat("AGENT_06_PREMATCH_OPP", status="RUNNING")
+
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    with get_db_connection() as conn:
+        matches = conn.execute("""
+        SELECT m.match_id, m.competition_code, m.home_team_id, m.away_team_id,
+               t1.canonical_name as home_name, t2.canonical_name as away_name,
+               s1.position as h_pos, s1.played_games as h_pj, s1.points as h_pts, s1.goals_for as h_gf, s1.goals_against as h_ga,
+               s2.position as a_pos, s2.played_games as a_pj, s2.points as a_pts, s2.goals_for as a_gf, s2.goals_against as a_ga
+        FROM matches m
+        JOIN teams t1 ON m.home_team_id = t1.team_id
+        JOIN teams t2 ON m.away_team_id = t2.team_id
+        LEFT JOIN team_season_stats s1 ON m.home_team_id = s1.team_id
+        LEFT JOIN team_season_stats s2 ON m.away_team_id = s2.team_id
+        ORDER BY m.kickoff_utc ASC;
+        """).fetchall()
+
+        for m in matches:
+            m_id = int(m["match_id"])
+
+            if m["h_pj"] and m["a_pj"] and int(m["h_pj"]) > 0 and int(m["a_pj"]) > 0:
+                h_gf_pg = float(m["h_gf"]) / float(m["h_pj"])
+                h_ga_pg = float(m["h_ga"]) / float(m["h_pj"])
+                a_gf_pg = float(m["a_gf"]) / float(m["a_pj"])
+                a_ga_pg = float(m["a_ga"]) / float(m["a_pj"])
+
+                lambda_h = round(max(0.45, min(3.40, ((h_gf_pg + a_ga_pg) / 2.0) * 1.12)), 2)
+                lambda_a = round(max(0.35, min(3.10, ((a_gf_pg + h_ga_pg) / 2.0) * 0.90)), 2)
+                stats_note = (
+                    f"{m['home_name']} ({m['h_pos']}o, {m['h_pts']} pts, {m['h_gf']} GF / {m['h_ga']} GC en {m['h_pj']} PJ) vs "
+                    f"{m['away_name']} ({m['a_pos']}o, {m['a_pts']} pts, {m['a_gf']} GF / {m['a_ga']} GC en {m['a_pj']} PJ). "
+                    f"Goles esperados Poisson: Local {lambda_h} - Visitante {lambda_a}."
+                )
+                has_real_standings = True
+            else:
+                lambda_h = 1.48
+                lambda_a = 1.18
+                stats_note = f"Fase europea / Sin tabla domestica cruzada. Lambda base: {lambda_h} vs {lambda_a}."
+                has_real_standings = False
+
+            probs = QuantStatsAgent.calculate_match_probabilities(lambda_h, lambda_a)
+
+            odds_rows = conn.execute(
+                "SELECT selection, odd_value, implied_prob_fair, bookmaker FROM odds_snapshots WHERE match_id = ? AND market = '1X2';",
+                (m_id,)
+            ).fetchall()
+            odds_map = {r["selection"]: r for r in odds_rows}
+
+            candidates = [
+                ("HOME", f"Victoria {m['home_name']} (1)", float(probs["p_home"])),
+                ("DRAW", "Empate (X)", float(probs["p_draw"])),
+                ("AWAY", f"Victoria {m['away_name']} (2)", float(probs["p_away"])),
+            ]
+
+            best_eval = None
+            for sel_code, sel_label, p_est in candidates:
+                if sel_code in odds_map:
+                    odd_val = float(odds_map[sel_code]["odd_value"])
+                    fair_mkt = float(odds_map[sel_code]["implied_prob_fair"])
+                    ev = (p_est * odd_val) - 1.0
+                else:
+                    odd_val = None
+                    fair_mkt = None
+                    ev = None
+
+                item = {
+                    "sel_code": sel_code,
+                    "sel_label": sel_label,
+                    "p_est": p_est,
+                    "odd_val": odd_val,
+                    "fair_mkt": fair_mkt,
+                    "ev": ev
+                }
+                if best_eval is None:
+                    best_eval = item
+                else:
+                    if item["ev"] is not None and (best_eval["ev"] is None or item["ev"] > best_eval["ev"]):
+                        best_eval = item
+                    elif item["ev"] is None and best_eval["ev"] is None and item["p_est"] > best_eval["p_est"]:
+                        best_eval = item
+
+            if best_eval["odd_val"] is None:
+                decision = "SIN_CUOTAS_VERIFICADAS"
+                confidence = "MEDIA" if has_real_standings else "BAJA"
+                reason_text = f"{stats_note} | Favorito estadistico: {best_eval['sel_label']} ({best_eval['p_est']*100:.1f}%). Cuotas aun no abiertas o no vinculadas en The Odds API."
+            else:
+                ev_val = best_eval["ev"]
+                if ev_val >= 0.04 and best_eval["p_est"] >= 0.38 and has_real_standings:
+                    decision = "OPORTUNIDAD"
+                    confidence = "ALTA" if ev_val >= 0.08 else "MEDIA"
+                    reason_text = f"{stats_note} | Discrepancia detectada en {best_eval['sel_label']}: Modelo estima {best_eval['p_est']*100:.1f}% (Cuota justa {1.0/best_eval['p_est']:.2f}) frente a cuota real {best_eval['odd_val']}."
+                elif ev_val >= 0.015:
+                    decision = "VIGILAR"
+                    confidence = "MEDIA"
+                    reason_text = f"{stats_note} | Ligero valor en {best_eval['sel_label']} (EV +{ev_val*100:.1f}%), pero margen insuficiente para entrar pre-partido."
+                else:
+                    decision = "NO_APOSTAR"
+                    confidence = "ALTA"
+                    reason_text = f"{stats_note} | Cuotas eficientes. Mejor opcion ({best_eval['sel_label']} a {best_eval['odd_val']}) tiene EV {ev_val*100:+.1f}%. Mercado bien ajustado por las casas."
+
+            conn.execute("DELETE FROM predictions_audit WHERE match_id = ? AND stage = 'PREMATCH';", (m_id,))
+            conn.execute("""
+            INSERT INTO predictions_audit (
+                match_id, stage, market, selection, estimated_prob, observed_odd,
+                fair_prob_market, expected_value, confidence_level, decision, reasoning_json, created_at_utc
+            ) VALUES (?, 'PREMATCH', '1X2', ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                m_id,
+                best_eval["sel_code"],
+                round(best_eval["p_est"], 4),
+                best_eval["odd_val"],
+                best_eval["fair_mkt"],
+                round(best_eval["ev"], 4) if best_eval["ev"] is not None else None,
+                confidence,
+                decision,
+                reason_text,
+                now_str
+            ))
+
+    for code in ["AGENT_01_ORCHESTRATOR", "AGENT_02_QUANTSTATS", "AGENT_03_MARKETODDS", "AGENT_04_05_CONTEXT", "AGENT_06_PREMATCH_OPP", "AGENT_09_DATAGUARD"]:
+        record_agent_heartbeat(code, status="IDLE")
+
+
+if __name__ == "__main__":
+    init_database()
+    ensure_standings_table()
+    purge_synthetic_and_test_data()
+    sync_standings_and_matches_football_data()
+    sync_real_odds_from_the_odds_api()
+    run_real_statistical_analysis()

@@ -1,0 +1,23 @@
+===================================================================
+INSTRUCCIONES RÁPIDAS - FOOTBALL INTELLIGENCE (FASE 2)
+===================================================================
+
+No tienes que crear ninguna carpeta ni archivo a mano. Ya está todo
+estructurado dentro de esta carpeta.
+
+PASO 1:
+Descomprime este archivo ZIP en cualquier lugar de tu ordenador
+(por ejemplo, en el Escritorio o en Documentos).
+
+PASO 2 (Opcional ahora, necesario para Fase 3):
+Abre el archivo llamado ".env" con el Bloc de notas de Windows o VS Code
+y pega tus claves de API entre las comillas (por ejemplo SPORTSCORE_API_KEY="tu_clave").
+Guarda el archivo.
+
+PASO 3:
+Haz DOBLE CLIC sobre el archivo:
+   INSTALAR_Y_PROBAR_WINDOWS.bat
+
+Ese archivo creará él solo el entorno virtual (.venv), instalará las
+librerías, creará la base de datos SQLite en modo WAL y mostrará por
+pantalla las tablas de diagnóstico.

@@ -1,0 +1,10 @@
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+httpx>=0.26.0
+scipy>=1.11.0
+numpy>=1.26.0
+pandas>=2.1.0
+streamlit>=1.30.0
+rich>=13.7.0
+python-dotenv>=1.0.0
+tzdata>=2023.4
