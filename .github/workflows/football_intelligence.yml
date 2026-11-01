@@ -2,9 +2,9 @@ name: Football Intelligence Autonomous Cloud
 
 on:
   schedule:
-    # Se ejecuta automaticamente cada 3 horas todos los dias (08:00, 11:00, 14:00, 17:00, 20:00, 23:00 UTC)
-    - cron: '0 8,11,14,17,20,23 * * *'
-  workflow_dispatch: # Permite lanzarlo manualmente con un boton desde la web de GitHub
+    # Se ejecuta cada 25 minutos durante las franjas horarias de partidos europeos (11:00 a 22:55 UTC)
+    - cron: '5,30,55 11-22 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. Ejecutar Agentes y Notificar a Telegram
+      - name: 4. Ejecutar Agentes (Bwin + Prepartido <3h + Directo)
         env:
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -39,10 +39,10 @@ jobs:
         run: |
           python scripts/github_runner.py
 
-      - name: 5. Guardar base de datos SQLite actualizada en el repositorio
+      - name: 5. Guardar base de datos SQLite actualizada
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
+          git config --local user.email "irasmikel@users.noreply.github.com"
+          git config --local user.name "irasmikel"
           git add data/*.db || true
-          git diff --staged --quiet || git commit -m "chore: actualizacion automatica de partidos y alertas SQLite [skip ci]"
+          git diff --staged --quiet || git commit -m "chore: actualizacion automatica Bwin y alertas SQLite [skip ci]"
           git push || true

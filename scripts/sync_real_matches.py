@@ -13,7 +13,7 @@ from core.logger import get_logger
 from core.database import init_database, get_db_connection, record_agent_heartbeat
 from agents.quantstats import QuantStatsAgent
 
-logger = get_logger("RealDataSyncV3")
+logger = get_logger("RealDataSyncV4")
 
 
 def log_api_call(provider: str, endpoint: str, status_code: int) -> None:
@@ -27,11 +27,7 @@ def log_api_call(provider: str, endpoint: str, status_code: int) -> None:
 
 
 def purge_synthetic_and_test_data() -> None:
-    logger.info("Limpiando datos de prueba y registros sinteticos anteriores...")
     with get_db_connection() as conn:
-        conn.execute("DELETE FROM live_alerts;")
-        conn.execute("DELETE FROM predictions_audit;")
-        conn.execute("DELETE FROM odds_snapshots;")
         conn.execute("DELETE FROM matches WHERE football_data_match_id IS NULL OR football_data_match_id < 10000;")
 
 
@@ -59,57 +55,76 @@ def normalize_team_key(name: str) -> str:
     if not name:
         return ""
     s = name.lower().strip()
-    for token in ["fc", "cf", "ud", "rcd", "cd", "ssc", "ac", "as", "rb", "vfl", "1.", "sv", "bsc", "tsg", "sc", "osc", "rc", "afc", "de futbol", "de bilbao", "balompie", "club"]:
-        s = s.replace(f" {token} ", " ").replace(f"^{token} ", "").replace(f" {token}$", "")
     replacements = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n", "ö": "o", "ä": "a",
-        "athletic": "athletic bilbao",
-        "real sociedad": "real sociedad",
-        "atletico": "atletico madrid",
-        "celta": "celta vigo",
-        "betis": "real betis",
-        "alaves": "alaves",
-        "espanyol": "espanyol",
-        "barcelona": "barcelona",
-        "real madrid": "real madrid",
-        "manchester united": "man united",
-        "manchester city": "man city",
-        "tottenham": "tottenham",
-        "newcastle": "newcastle",
-        "wolverhampton": "wolves",
-        "nottingham": "nottingham",
-        "brighton": "brighton",
-        "west ham": "west ham",
-        "aston villa": "aston villa",
-        "bournemouth": "bournemouth",
-        "inter": "inter milan",
-        "milan": "ac milan",
-        "napoli": "napoli",
-        "juventus": "juventus",
-        "atalanta": "atalanta",
-        "bologna": "bologna",
-        "fiorentina": "fiorentina",
-        "lazio": "lazio",
-        "roma": "roma",
-        "bayern": "bayern munich",
-        "leverkusen": "bayer leverkusen",
-        "dortmund": "borussia dortmund",
-        "leipzig": "rb leipzig",
-        "frankfurt": "eintracht frankfurt",
-        "stuttgart": "stuttgart",
-        "m'gladbach": "monchengladbach",
-        "monchengladbach": "monchengladbach",
-        "paris": "paris saint germain",
-        "psg": "paris saint germain",
-        "marseille": "marseille",
-        "monaco": "monaco",
-        "lille": "lille",
-        "lyon": "lyon",
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n", "ö": "o", "ä": "a", "ç": "c",
+        "athletic club": "athleticbilbao",
+        "athletic bilbao": "athleticbilbao",
+        "real sociedad": "realsociedad",
+        "atletico madrid": "atleticomadrid",
+        "club atletico de madrid": "atleticomadrid",
+        "celta vigo": "celtavigo",
+        "rc celta": "celtavigo",
+        "real betis": "realbetis",
+        "deportivo alaves": "alaves",
+        "rcd espanyol": "espanyol",
+        "fc barcelona": "barcelona",
+        "real madrid": "realmadrid",
+        "manchester united": "manunited",
+        "man united": "manunited",
+        "manchester city": "mancity",
+        "man city": "mancity",
+        "tottenham hotspur": "tottenham",
+        "newcastle united": "newcastle",
+        "wolverhampton wanderers": "wolves",
+        "nottingham forest": "nottinghamforest",
+        "brighton & hove albion": "brighton",
+        "brighton and hove albion": "brighton",
+        "west ham united": "westham",
+        "aston villa": "astonvilla",
+        "afc bournemouth": "bournemouth",
+        "inter milan": "intermilan",
+        "fc internazionale milano": "intermilan",
+        "internazionale": "intermilan",
+        "ac milan": "acmilan",
+        "ssc napoli": "napoli",
+        "atalanta bc": "atalanta",
+        "hellas verona": "verona",
+        "como 1907": "como",
+        "bayern munich": "bayernmunich",
+        "fc bayern munchen": "bayernmunich",
+        "bayer leverkusen": "bayerleverkusen",
+        "bayer 04 leverkusen": "bayerleverkusen",
+        "borussia dortmund": "borussiadortmund",
+        "rb leipzig": "rbleipzig",
+        "eintracht frankfurt": "eintrachtfrankfurt",
+        "vfb stuttgart": "stuttgart",
+        "borussia monchengladbach": "monchengladbach",
+        "1. fc koln": "koln",
+        "fc koln": "koln",
+        "1. fc union berlin": "unionberlin",
+        "union berlin": "unionberlin",
+        "1. fsv mainz 05": "mainz",
+        "paris saint-germain": "psg",
+        "paris saint germain": "psg",
+        "paris fc": "parisfc",
+        "olympique marseille": "marseille",
+        "olympique de marseille": "marseille",
+        "olympique lyonnais": "lyon",
+        "as monaco": "monaco",
+        "losc lille": "lille",
+        "rc lens": "lens",
+        "stade brestois 29": "brest",
+        "stade rennais": "rennes",
+        "rc strasbourg alsace": "strasbourg",
+        "psv eindhoven": "psv",
+        "club brugge kv": "clubbrugge",
+        "sporting cp": "sportinglisbon",
     }
     for k, v in replacements.items():
         if k in s:
-            s = s.replace(k, v)
-    return "".join(ch for ch in s if ch.isalnum())
+            return v
+    tokens = [t for t in s.replace("-", " ").split() if t not in ("fc", "cf", "ud", "rcd", "cd", "ssc", "ac", "as", "rb", "vfl", "1.", "sv", "bsc", "tsg", "sc", "osc", "rc", "afc", "club", "de", "balompie", "kv", "bc", "04", "05", "1907", "29")]
+    return "".join(ch for ch in "".join(tokens) if ch.isalnum())
 
 
 def teams_match(name_a: str, name_b: str) -> bool:
@@ -117,7 +132,16 @@ def teams_match(name_a: str, name_b: str) -> bool:
     kb = normalize_team_key(name_b)
     if not ka or not kb:
         return False
-    return ka == kb or ka in kb or kb in ka or ka[:6] == kb[:6]
+    if ka == kb:
+        return True
+    if len(ka) >= 5 and len(kb) >= 5 and (ka in kb or kb in ka):
+        # Evitar falsos cruces como paris vs parisfc o manunited vs mancity
+        if {"psg", "parisfc"} <= {ka, kb}:
+            return False
+        if {"manunited", "mancity"} <= {ka, kb}:
+            return False
+        return True
+    return False
 
 
 def get_or_create_team(conn, team_name: str, comp_code: str, fd_team_id: int = None) -> int:
@@ -147,7 +171,7 @@ def sync_standings_and_matches_football_data() -> int:
     headers = {"X-Auth-Token": token}
 
     date_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_to = (datetime.now(timezone.utc) + timedelta(days=4)).strftime("%Y-%m-%d")
+    date_to = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d")
 
     with get_db_connection() as conn:
         comps = conn.execute("SELECT canonical_code, football_data_code, name FROM competitions WHERE is_active = 1;").fetchall()
@@ -265,6 +289,12 @@ def sync_standings_and_matches_football_data() -> int:
 
 
 def sync_real_odds_from_the_odds_api() -> int:
+    """
+    SUBAGENTE BWIN EXCLUSIVO:
+    Prioriza extraer la cuota exacta de BWIN (key='bwin') en mercados 1X2 (h2h)
+    y Linea de 2.5 Goles (totals). Si Bwin aun no ha publicado linea para ese partido,
+    usa la casa europea mas cercana indicando claramente si es Bwin oficial o referencia EU.
+    """
     if not settings.is_key_configured(settings.odds_api_key):
         return 0
 
@@ -296,7 +326,7 @@ def sync_real_odds_from_the_odds_api() -> int:
             params = {
                 "apiKey": api_key,
                 "regions": "eu",
-                "markets": "h2h",
+                "markets": "h2h,totals",
                 "oddsFormat": "decimal"
             }
 
@@ -323,15 +353,27 @@ def sync_real_odds_from_the_odds_api() -> int:
                     if not target_match:
                         continue
 
-                    odd_h_list, odd_x_list, odd_a_list = [], [], []
-                    bookie_names = []
+                    # 1. Buscar especificamente BWIN primero
+                    bwin_bm = None
                     for bm in bookmakers:
-                        bm_title = bm.get("title", "EU Bookie")
+                        if bm.get("key", "").lower() == "bwin" or "bwin" in bm.get("title", "").lower():
+                            bwin_bm = bm
+                            break
+
+                    chosen_bms = [bwin_bm] if bwin_bm else bookmakers
+                    bm_label = "Bwin" if bwin_bm else "Bwin (Ref. Mercado EU)"
+
+                    odd_h_list, odd_x_list, odd_a_list = [], [], []
+                    over25_list, under25_list = [], []
+
+                    for bm in chosen_bms:
+                        if not bm:
+                            continue
                         for mk in bm.get("markets", []):
-                            if mk.get("key") == "h2h":
-                                outcomes = mk.get("outcomes", [])
+                            m_key = mk.get("key")
+                            if m_key == "h2h":
                                 o_h, o_x, o_a = None, None, None
-                                for out in outcomes:
+                                for out in mk.get("outcomes", []):
                                     if out.get("name") == ev_home:
                                         o_h = float(out.get("price", 0))
                                     elif out.get("name") == ev_away:
@@ -342,44 +384,76 @@ def sync_real_odds_from_the_odds_api() -> int:
                                     odd_h_list.append(o_h)
                                     odd_x_list.append(o_x)
                                     odd_a_list.append(o_a)
-                                    bookie_names.append(bm_title)
-
-                    if not odd_h_list:
-                        continue
-
-                    avg_h = round(sum(odd_h_list) / len(odd_h_list), 2)
-                    avg_x = round(sum(odd_x_list) / len(odd_x_list), 2)
-                    avg_a = round(sum(odd_a_list) / len(odd_a_list), 2)
-
-                    raw_h = 1.0 / avg_h
-                    raw_x = 1.0 / avg_x
-                    raw_a = 1.0 / avg_a
-                    overround = (raw_h + raw_x + raw_a) - 1.0
-                    total_raw = raw_h + raw_x + raw_a
+                            elif m_key == "totals":
+                                o_ov, o_un = None, None
+                                for out in mk.get("outcomes", []):
+                                    pt = float(out.get("point", 0.0))
+                                    if abs(pt - 2.5) < 0.05:
+                                        if out.get("name", "").lower() == "over":
+                                            o_ov = float(out.get("price", 0))
+                                        elif out.get("name", "").lower() == "under":
+                                            o_un = float(out.get("price", 0))
+                                if o_ov and o_un:
+                                    over25_list.append(o_ov)
+                                    under25_list.append(o_un)
 
                     m_id = int(target_match["match_id"])
-                    bm_label = f"Media {len(odd_h_list)} Casas EU ({bookie_names[0]})"
-
                     with get_db_connection() as conn:
-                        conn.execute("DELETE FROM odds_snapshots WHERE match_id = ? AND market = '1X2';", (m_id,))
-                        for sel, odd_v, r_p in [("HOME", avg_h, raw_h), ("DRAW", avg_x, raw_x), ("AWAY", avg_a, raw_a)]:
-                            conn.execute("""
-                            INSERT INTO odds_snapshots (
-                                match_id, bookmaker, market, selection, odd_value,
-                                implied_prob_raw, implied_prob_fair, market_margin, captured_at_utc
-                            ) VALUES (?, ?, '1X2', ?, ?, ?, ?, ?, ?);
-                            """, (
-                                m_id, bm_label, sel, odd_v,
-                                round(r_p, 4), round(r_p / total_raw, 4), round(overround, 4), now_str
-                            ))
-                    matched_odds_count += 1
+                        conn.execute("DELETE FROM odds_snapshots WHERE match_id = ?;", (m_id,))
+
+                        if odd_h_list:
+                            avg_h = round(sum(odd_h_list) / len(odd_h_list), 2)
+                            avg_x = round(sum(odd_x_list) / len(odd_x_list), 2)
+                            avg_a = round(sum(odd_a_list) / len(odd_a_list), 2)
+                            raw_h, raw_x, raw_a = 1.0 / avg_h, 1.0 / avg_x, 1.0 / avg_a
+                            total_raw = raw_h + raw_x + raw_a
+                            overround = total_raw - 1.0
+
+                            for sel, odd_v, r_p in [("HOME", avg_h, raw_h), ("DRAW", avg_x, raw_x), ("AWAY", avg_a, raw_a)]:
+                                conn.execute("""
+                                INSERT INTO odds_snapshots (
+                                    match_id, bookmaker, market, selection, odd_value,
+                                    implied_prob_raw, implied_prob_fair, market_margin, captured_at_utc
+                                ) VALUES (?, ?, '1X2', ?, ?, ?, ?, ?, ?);
+                                """, (
+                                    m_id, bm_label, sel, odd_v,
+                                    round(r_p, 4), round(r_p / total_raw, 4), round(overround, 4), now_str
+                                ))
+
+                        if over25_list:
+                            avg_ov = round(sum(over25_list) / len(over25_list), 2)
+                            avg_un = round(sum(under25_list) / len(under25_list), 2)
+                            raw_ov, raw_un = 1.0 / avg_ov, 1.0 / avg_un
+                            tot_ou = raw_ov + raw_un
+                            margin_ou = tot_ou - 1.0
+
+                            for sel, odd_v, r_p in [("OVER_2.5", avg_ov, raw_ov), ("UNDER_2.5", avg_un, raw_un)]:
+                                conn.execute("""
+                                INSERT INTO odds_snapshots (
+                                    match_id, bookmaker, market, selection, odd_value,
+                                    implied_prob_raw, implied_prob_fair, market_margin, captured_at_utc
+                                ) VALUES (?, ?, 'OVER_UNDER_25', ?, ?, ?, ?, ?, ?);
+                                """, (
+                                    m_id, bm_label, sel, odd_v,
+                                    round(r_p, 4), round(r_p / tot_ou, 4), round(margin_ou, 4), now_str
+                                ))
+
+                    if odd_h_list:
+                        matched_odds_count += 1
             except Exception as e:
-                logger.error(f"Error consultando The Odds API para {comp['name']}: {e}")
+                logger.error(f"Error consultando Bwin / The Odds API para {comp['name']}: {e}")
 
     return matched_odds_count
 
 
 def run_real_statistical_analysis() -> None:
+    """
+    CALIBRACION BAYESIANA + ANCLAJE DE MERCADO:
+    1. Aplica regresion a la media (Shrinkage Bayesiano: 55% datos temporada actual + 45% media historica).
+    2. Ancla la probabilidad final con la probabilidad implicita limpia de Bwin (60% Mercado + 40% Poisson)
+       para eliminar EVs irreales del +40% o +60%.
+    3. Solo marca OPORTUNIDAD si el Valor Esperado (EV) esta en la franja profesional realista: +3.5% a +16.0%.
+    """
     record_agent_heartbeat("AGENT_02_QUANTSTATS", status="RUNNING")
     record_agent_heartbeat("AGENT_03_MARKETODDS", status="RUNNING")
     record_agent_heartbeat("AGENT_06_PREMATCH_OPP", status="RUNNING")
@@ -402,95 +476,136 @@ def run_real_statistical_analysis() -> None:
 
         for m in matches:
             m_id = int(m["match_id"])
+            is_euro_cup = m["competition_code"] in ("EU_UCL", "EU_UEL")
 
-            if m["h_pj"] and m["a_pj"] and int(m["h_pj"]) > 0 and int(m["a_pj"]) > 0:
+            if m["h_pj"] and m["a_pj"] and int(m["h_pj"]) >= 3 and int(m["a_pj"]) >= 3:
                 h_gf_pg = float(m["h_gf"]) / float(m["h_pj"])
                 h_ga_pg = float(m["h_ga"]) / float(m["h_pj"])
                 a_gf_pg = float(m["a_gf"]) / float(m["a_pj"])
                 a_ga_pg = float(m["a_ga"]) / float(m["a_pj"])
 
-                lambda_h = round(max(0.45, min(3.40, ((h_gf_pg + a_ga_pg) / 2.0) * 1.12)), 2)
-                lambda_a = round(max(0.35, min(3.10, ((a_gf_pg + h_ga_pg) / 2.0) * 0.90)), 2)
+                raw_lh = ((h_gf_pg + a_ga_pg) / 2.0) * 1.10
+                raw_la = ((a_gf_pg + h_ga_pg) / 2.0) * 0.92
+
+                # Shrinkage Bayesiano hacia la media de la competicion (mas conservador en Champions)
+                w_sample = 0.35 if is_euro_cup else 0.55
+                lambda_h = round(max(0.65, min(2.65, (raw_lh * w_sample) + (1.48 * (1.0 - w_sample)))), 2)
+                lambda_a = round(max(0.55, min(2.35, (raw_la * w_sample) + (1.18 * (1.0 - w_sample)))), 2)
+
                 stats_note = (
-                    f"{m['home_name']} ({m['h_pos']}o, {m['h_pts']} pts, {m['h_gf']} GF / {m['h_ga']} GC en {m['h_pj']} PJ) vs "
-                    f"{m['away_name']} ({m['a_pos']}o, {m['a_pts']} pts, {m['a_gf']} GF / {m['a_ga']} GC en {m['a_pj']} PJ). "
-                    f"Goles esperados Poisson: Local {lambda_h} - Visitante {lambda_a}."
+                    f"{m['home_name']} ({m['h_pos']}o, {m['h_pts']} pts, {m['h_gf']} goles a favor y {m['h_ga']} en contra) vs "
+                    f"{m['away_name']} ({m['a_pos']}o, {m['a_pts']} pts, {m['a_gf']} goles a favor y {m['a_ga']} en contra)."
                 )
                 has_real_standings = True
             else:
                 lambda_h = 1.48
                 lambda_a = 1.18
-                stats_note = f"Fase europea / Sin tabla domestica cruzada. Lambda base: {lambda_h} vs {lambda_a}."
+                stats_note = f"{m['home_name']} vs {m['away_name']} (Competicion europea / Muestra corta)."
                 has_real_standings = False
 
             probs = QuantStatsAgent.calculate_match_probabilities(lambda_h, lambda_a)
 
             odds_rows = conn.execute(
-                "SELECT selection, odd_value, implied_prob_fair, bookmaker FROM odds_snapshots WHERE match_id = ? AND market = '1X2';",
+                "SELECT market, selection, odd_value, implied_prob_fair, bookmaker FROM odds_snapshots WHERE match_id = ?;",
                 (m_id,)
             ).fetchall()
             odds_map = {r["selection"]: r for r in odds_rows}
 
             candidates = [
-                ("HOME", f"Victoria {m['home_name']} (1)", float(probs["p_home"])),
-                ("DRAW", "Empate (X)", float(probs["p_draw"])),
-                ("AWAY", f"Victoria {m['away_name']} (2)", float(probs["p_away"])),
+                ("1X2", "HOME", f"Gana {m['home_name']} (Local)", float(probs["p_home"])),
+                ("1X2", "DRAW", "Empate", float(probs["p_draw"])),
+                ("1X2", "AWAY", f"Gana {m['away_name']} (Visitante)", float(probs["p_away"])),
+                ("OVER_UNDER_25", "OVER_2.5", "Mas de 2.5 goles en el partido", float(probs["p_over_25"])),
+                ("OVER_UNDER_25", "UNDER_2.5", "Menos de 2.5 goles en el partido", float(probs["p_under_25"])),
             ]
 
             best_eval = None
-            for sel_code, sel_label, p_est in candidates:
+            for mkt_code, sel_code, sel_label, p_poisson in candidates:
                 if sel_code in odds_map:
                     odd_val = float(odds_map[sel_code]["odd_value"])
                     fair_mkt = float(odds_map[sel_code]["implied_prob_fair"])
-                    ev = (p_est * odd_val) - 1.0
+
+                    # Probabilidad calibrada combinando nuestro modelo Poisson con la eficiencia del mercado
+                    w_model = 0.35 if is_euro_cup else 0.45
+                    p_calibrated = (p_poisson * w_model) + (fair_mkt * (1.0 - w_model))
+                    ev = (p_calibrated * odd_val) - 1.0
                 else:
+                    if mkt_code != "1X2":
+                        continue
                     odd_val = None
                     fair_mkt = None
+                    p_calibrated = p_poisson
                     ev = None
 
                 item = {
+                    "mkt_code": mkt_code,
                     "sel_code": sel_code,
                     "sel_label": sel_label,
-                    "p_est": p_est,
+                    "p_est": p_calibrated,
                     "odd_val": odd_val,
                     "fair_mkt": fair_mkt,
                     "ev": ev
                 }
+
+                # Preferimos una opcion con EV realista (entre 3.5% y 16%) y cuota jugable en Bwin (1.50 a 3.30)
                 if best_eval is None:
                     best_eval = item
                 else:
-                    if item["ev"] is not None and (best_eval["ev"] is None or item["ev"] > best_eval["ev"]):
-                        best_eval = item
-                    elif item["ev"] is None and best_eval["ev"] is None and item["p_est"] > best_eval["p_est"]:
+                    if item["ev"] is not None:
+                        item_valid = (0.035 <= item["ev"] <= 0.16) and (1.48 <= item["odd_val"] <= 3.35)
+                        best_valid = (best_eval["ev"] is not None) and (0.035 <= best_eval["ev"] <= 0.16) and (1.48 <= best_eval["odd_val"] <= 3.35)
+                        if item_valid and not best_valid:
+                            best_eval = item
+                        elif item_valid and best_valid and item["ev"] > best_eval["ev"]:
+                            best_eval = item
+                        elif not item_valid and not best_valid and (best_eval["ev"] is None or item["ev"] > best_eval["ev"]):
+                            best_eval = item
+                    elif best_eval["ev"] is None and item["p_est"] > best_eval["p_est"]:
                         best_eval = item
 
             if best_eval["odd_val"] is None:
                 decision = "SIN_CUOTAS_VERIFICADAS"
-                confidence = "MEDIA" if has_real_standings else "BAJA"
-                reason_text = f"{stats_note} | Favorito estadistico: {best_eval['sel_label']} ({best_eval['p_est']*100:.1f}%). Cuotas aun no abiertas o no vinculadas en The Odds API."
+                confidence = "BAJA"
+                reason_text = f"{stats_note} Pronostico mas probable: {best_eval['sel_label']} ({best_eval['p_est']*100:.1f}%). Esperando cuota en Bwin."
             else:
                 ev_val = best_eval["ev"]
-                if ev_val >= 0.04 and best_eval["p_est"] >= 0.38 and has_real_standings:
+                odd_v = best_eval["odd_val"]
+                fair_odd = round(1.0 / best_eval["p_est"], 2)
+
+                if 0.035 <= ev_val <= 0.16 and 1.48 <= odd_v <= 3.35 and has_real_standings:
                     decision = "OPORTUNIDAD"
-                    confidence = "ALTA" if ev_val >= 0.08 else "MEDIA"
-                    reason_text = f"{stats_note} | Discrepancia detectada en {best_eval['sel_label']}: Modelo estima {best_eval['p_est']*100:.1f}% (Cuota justa {1.0/best_eval['p_est']:.2f}) frente a cuota real {best_eval['odd_val']}."
-                elif ev_val >= 0.015:
+                    confidence = "ALTA" if ev_val >= 0.065 else "MEDIA"
+                    reason_text = (
+                        f"{stats_note} En Bwin se paga a {odd_v}, mientras que por sus numeros reales deberia pagarse a {fair_odd}."
+                    )
+                elif ev_val > 0.16:
                     decision = "VIGILAR"
                     confidence = "MEDIA"
-                    reason_text = f"{stats_note} | Ligero valor en {best_eval['sel_label']} (EV +{ev_val*100:.1f}%), pero margen insuficiente para entrar pre-partido."
+                    reason_text = (
+                        f"{stats_note} Cuota en Bwin ({odd_v}) inusualmente alta respecto a la estadistica ({fair_odd}). Vigilar posibles rotaciones o bajas antes de entrar."
+                    )
+                elif 0.015 <= ev_val < 0.035:
+                    decision = "VIGILAR"
+                    confidence = "MEDIA"
+                    reason_text = (
+                        f"{stats_note} Cuota en Bwin ({odd_v}) ligeramente por encima de su valor justo ({fair_odd}), ideal para buscar mejor cuota en directo."
+                    )
                 else:
                     decision = "NO_APOSTAR"
                     confidence = "ALTA"
-                    reason_text = f"{stats_note} | Cuotas eficientes. Mejor opcion ({best_eval['sel_label']} a {best_eval['odd_val']}) tiene EV {ev_val*100:+.1f}%. Mercado bien ajustado por las casas."
+                    reason_text = (
+                        f"{stats_note} La cuota de Bwin ({odd_v}) esta bien ajustada por debajo de su cuota justa ({fair_odd}). No merece la pena arriesgar."
+                    )
 
             conn.execute("DELETE FROM predictions_audit WHERE match_id = ? AND stage = 'PREMATCH';", (m_id,))
             conn.execute("""
             INSERT INTO predictions_audit (
                 match_id, stage, market, selection, estimated_prob, observed_odd,
                 fair_prob_market, expected_value, confidence_level, decision, reasoning_json, created_at_utc
-            ) VALUES (?, 'PREMATCH', '1X2', ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            ) VALUES (?, 'PREMATCH', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 m_id,
+                best_eval["mkt_code"],
                 best_eval["sel_code"],
                 round(best_eval["p_est"], 4),
                 best_eval["odd_val"],
